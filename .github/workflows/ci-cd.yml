@@ -1,0 +1,232 @@
+name: CI/CD
+
+# Cada cambio se compila y prueba en Windows y Ubuntu; si todo pasa se construye la imagen
+# Docker, se publica en GitHub Container Registry y se escanea con OWASP ZAP.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  LOCAL_IMAGE: test-main:ci
+  APP_PORT: "3000"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: Compilación y pruebas · ${{ matrix.os }} · Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v6
+
+      - name: Configurar Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci --no-audit --no-fund
+
+      - name: Verificar tipos
+        run: npm run typecheck
+
+      - name: Compilar
+        run: npm run build
+
+      - name: Pruebas unitarias y de API (con cobertura)
+        run: npm run test:ci
+
+      - name: Prueba de arranque del servidor
+        run: npm run smoke
+
+      - name: Resumen de pruebas
+        if: always()
+        run: node scripts/ci-summary.mjs "${{ matrix.os }} - Node ${{ matrix.node }}"
+
+      - name: Publicar reportes de pruebas
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-reports-${{ matrix.os }}-node${{ matrix.node }}
+          path: |
+            reports/
+            coverage/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Imagen Docker y publicación en GHCR
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v6
+
+      - name: Definir nombre de la imagen
+        id: image
+        # GHCR exige minúsculas en el nombre del repositorio
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Generar etiquetas y metadatos OCI
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=Test-main
+            org.opencontainers.image.description=API de tareas con pipeline CI/CD
+
+      - name: Construir imagen
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ env.LOCAL_IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: APP_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Probar el contenedor
+        run: |
+          docker run -d --name smoke -p "${APP_PORT}:3000" "$LOCAL_IMAGE"
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://localhost:${APP_PORT}/health"; then echo; break; fi
+            sleep 1
+          done
+          curl -fsS "http://localhost:${APP_PORT}/health" > /dev/null
+          uid=$(docker exec smoke id -u)
+          echo "UID dentro del contenedor: $uid"
+          test "$uid" != "0" || { echo "::error::El contenedor no debe ejecutarse como root"; exit 1; }
+          curl -fsS -X POST -H "Content-Type: application/json" -d '{"title":"tarea de prueba"}' \
+            "http://localhost:${APP_PORT}/api/tasks"
+          echo
+          docker rm -f smoke
+
+      - name: Exportar imagen para el análisis de seguridad
+        run: docker save "$LOCAL_IMAGE" | gzip > image.tar.gz
+
+      - name: Guardar imagen como artefacto
+        uses: actions/upload-artifact@v6
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 3
+
+      - name: Iniciar sesión en GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar imagen en GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker push --all-tags "$IMAGE"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$LOCAL_IMAGE")
+          {
+            echo "### Imagen publicada en GHCR"
+            echo
+            echo "**Digest:** \`$digest\`"
+            echo
+            echo "| Etiqueta |"
+            echo "|---|"
+            docker image ls "$IMAGE" --format '| `{{.Repository}}:{{.Tag}}` |'
+            echo
+            echo '```bash'
+            echo "docker pull $IMAGE:sha-${GITHUB_SHA::7}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resumen (pull request sin publicación)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "### Imagen construida y probada" >> "$GITHUB_STEP_SUMMARY"
+          echo "En pull requests la imagen no se publica en GHCR." >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  zap:
+    name: Análisis de seguridad OWASP ZAP
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Obtener código (reglas de ZAP)
+        uses: actions/checkout@v6
+
+      - name: Descargar imagen construida
+        uses: actions/download-artifact@v7
+        with:
+          name: docker-image
+
+      - name: Levantar la aplicación
+        run: |
+          gunzip -c image.tar.gz | docker load
+          docker run -d --name app -p "${APP_PORT}:3000" "$LOCAL_IMAGE"
+          for _ in $(seq 1 30); do
+            curl -fsS "http://localhost:${APP_PORT}/health" && exit 0
+            sleep 1
+          done
+          docker logs app
+          exit 1
+
+      - name: Escaneo OWASP ZAP baseline
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: http://localhost:${{ env.APP_PORT }}
+          rules_file_name: .zap/rules.tsv
+          # -a: incluye reglas pasivas alfa · -I: las advertencias (WARN) no detienen el
+          # pipeline; solo lo hacen las reglas marcadas como FAIL en .zap/rules.tsv
+          cmd_options: -a -I
+          allow_issue_writing: false
+          fail_action: true
+          artifact_name: zap-report
+
+      - name: Registros de la aplicación
+        if: always()
+        run: docker logs app || true

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Test-main · Tareas</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Tareas</h1>
+      <p id="stats" aria-live="polite">Cargando…</p>
+    </header>
+    <form id="new-task" autocomplete="off">
+      <label for="title" class="sr-only">Nueva tarea</label>
+      <input id="title" name="title" maxlength="120" placeholder="Nueva tarea" required>
+      <button type="submit">Agregar</button>
+    </form>
+    <p id="error" role="alert" hidden></p>
+    <ul id="list"></ul>
+  </main>
+</body>
+</html>

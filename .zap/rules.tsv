@@ -1,0 +1,12 @@
+# Reglas del escaneo OWASP ZAP baseline: ID<TAB>ACCION<TAB>comentario
+# FAIL detiene el pipeline, WARN se informa, IGNORE se omite
+10020	FAIL	Falta cabecera anti-clickjacking (X-Frame-Options / frame-ancestors)
+10021	FAIL	Falta X-Content-Type-Options
+10038	FAIL	Falta Content-Security-Policy
+10037	FAIL	El servidor expone X-Powered-By
+10055	WARN	Debilidades en la Content-Security-Policy
+10063	WARN	Falta Permissions-Policy
+90004	WARN	Aislamiento insuficiente frente a Spectre (COEP/COOP/CORP)
+10096	IGNORE	Marcas de tiempo: createdAt/updatedAt son datos de la API
+10049	IGNORE	Contenido cacheable: los estaticos se cachean a proposito
+10109	IGNORE	Aplicacion web moderna (informativo)
