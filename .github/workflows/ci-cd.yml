@@ -63,7 +63,7 @@ jobs:
 
       - name: Publicar reportes de pruebas
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: test-reports-${{ matrix.os }}-node${{ matrix.node }}
           path: |
@@ -146,7 +146,7 @@ jobs:
         run: docker save "$LOCAL_IMAGE" | gzip > image.tar.gz
 
       - name: Guardar imagen como artefacto
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: docker-image
           path: image.tar.gz
